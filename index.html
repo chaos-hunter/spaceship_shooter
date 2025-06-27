@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>Meteor Dodger</title>
+    <style>
+        body { text-align: center; background: #111; color: #eee; font-family: Arial, sans-serif; margin: 0; padding: 20px; }
+        #gameContainer { position: relative; display: inline-block; }
+        canvas { border: 2px solid #444; background: #000; display: block; }
+        .overlay {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8);
+            display: flex; align-items: center; justify-content: center; flex-direction: column;
+        }
+        .overlay h2 { color: #fff; margin-bottom: 20px; }
+        .overlay button {
+            padding: 15px 30px; font-size: 24px; background: #e00; border: none;
+            border-radius: 8px; color: #fff; cursor: pointer;
+            margin: 5px;
+        }
+        #pauseBtn {
+            position: absolute; top: 10px; right: 10px; width: 32px; height: 32px;
+            background: rgba(255,255,255,0.2); border-radius: 4px; cursor: pointer;
+            display: none; align-items: center; justify-content: center;
+        }
+        #pauseBtn svg { width: 16px; height: 16px; fill: #fff; }
+    </style>
+</head>
+<body>
+    <h1>Meteor Dodger</h1>
+    <div id="gameContainer">
+        <canvas id="gameCanvas" width="800" height="600"></canvas>
+        <div id="startOverlay" class="overlay">
+            <h2>Touch to Start</h2>
+            <button id="playBtn">Play</button>
+            <div id="touchInstructions">
+                <h3>Mobile Controls</h3>
+                <p>Tap & drag to move.</p>
+                <p>Tap top-right for pause.</p>
+                <p>Tap canvas to fire.</p>
+                <h3>PC Controls</h3>
+                <p>Arrow keys to move.</p>
+                <p>Space to fire.</p>
+                <p>Click pause icon to pause.</p>
+            </div>
+        </div>
+        <div id="pauseOverlay" class="overlay" style="display:none;">
+            <h2>Paused</h2>
+            <button id="resumeBtn">Resume</button>
+        </div>
+        <div id="restartOverlay" class="overlay" style="display:none;">
+            <h2>Game Over</h2>
+            <button id="restartBtn">Restart</button>
+        </div>
+        <div id="pauseBtn" title="Pause/Play">
+            <svg id="pauseIcon" viewBox="0 0 64 64"><rect x="14" y="12" width="10" height="40"/><rect x="40" y="12" width="10" height="40"/></svg>
+            <svg id="playIcon" viewBox="0 0 64 64" style="display:none;"><polygon points="16,12 52,32 16,52"/></svg>
+        </div>
+    </div>
+    <script>
+        const canvas = document.getElementById('gameCanvas'), ctx = canvas.getContext('2d');
+        const width = canvas.width, height = canvas.height;
+        const startOverlay = document.getElementById('startOverlay');
+        const pauseOverlay = document.getElementById('pauseOverlay');
+        const restartOverlay = document.getElementById('restartOverlay');
+        const playBtn = document.getElementById('playBtn');
+        const resumeBtn = document.getElementById('resumeBtn');
+        const restartBtn = document.getElementById('restartBtn');
+        const pauseBtn = document.getElementById('pauseBtn');
+        const pauseIcon = document.getElementById('pauseIcon');
+        const playIcon = document.getElementById('playIcon');
+
+        let started=false, paused=false, gameOver=false, exploding=false, score=0;
+        const particles = [];
+
+        // Score constants
+        const COIN_VALUE = 10;
+
+        // Audio
+        const audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+        function playBeep(freq=880, dur=0.1){ const osc=audioCtx.createOscillator(), g=audioCtx.createGain(); osc.type='triangle'; osc.frequency.setValueAtTime(freq,audioCtx.currentTime); g.gain.setValueAtTime(0.1,audioCtx.currentTime); osc.connect(g).connect(audioCtx.destination); osc.start(); osc.stop(audioCtx.currentTime+dur); }
+        function playExplosionSound(){
+            const duration=0.3; const bufferSize=audioCtx.sampleRate*duration;
+            const buffer=audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+            const data=buffer.getChannelData(0);
+            for(let i=0;i<bufferSize;i++) data[i] = (Math.random()*2-1) * (1 - i/bufferSize);
+            const noise=audioCtx.createBufferSource(); noise.buffer = buffer;
+            const g=audioCtx.createGain(); g.gain.setValueAtTime(1, audioCtx.currentTime);
+            g.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + duration);
+            noise.connect(g).connect(audioCtx.destination);
+            noise.start();
+        }
+
+        // Player
+        const playerSize=25;
+        const player={x:width/2,y:height-playerSize*1.5,speed:12};
+        const keys={ArrowLeft:false,ArrowRight:false,ArrowUp:false,ArrowDown:false,Space:false};
+
+        // Game objects
+        const meteorCount=7, meteors=[], meteorSpeed=2.5;
+        const stars=[];
+        for(let i=0;i<150;i++) stars.push({x:Math.random()*width,y:Math.random()*height,size:Math.random()*2+1,speed:Math.random()*0.5+0.2});
+        const coins=[], coinSize=20;
+        const lasers=[]; const maxAmmo=5; let ammo=maxAmmo, lastReload=Date.now(), reloadInterval=10000;
+
+        // Generate an irregular meteor shape
+        function createMeteorShape(r, verts=8) {
+            const pts = [];
+            for(let i=0; i<verts; i++) {
+                const angle = (i/verts)*Math.PI*2 + (Math.random()-0.5)*(Math.PI*2/verts)*0.5;
+                const rad = r*(0.7 + Math.random()*0.3);
+                pts.push({ x: Math.cos(angle)*rad, y: Math.sin(angle)*rad });
+            }
+            return pts;
+        }
+
+        function initGame(){
+            started=true; paused=false; gameOver=false; exploding=false; score=0;
+            particles.length=0; meteors.length=0;
+            for(let i=0;i<meteorCount;i++){
+                const r = 20+Math.random()*10;
+                meteors.push({ x:Math.random()*(width-40)+20, y:-Math.random()*height, r, angle:Math.random()*2*Math.PI, shape: createMeteorShape(r) });
+            }
+            coins.length=0; spawnCoin(); lasers.length=0;
+            ammo=maxAmmo; lastReload=Date.now();
+            startOverlay.style.display='none'; pauseOverlay.style.display='none'; restartOverlay.style.display='none';
+            pauseBtn.style.display='flex'; pauseIcon.style.display='block'; playIcon.style.display='none';
+            requestAnimationFrame(gameLoop);
+        }
+        function spawnCoin(){ coins.push({x:Math.random()*(width-coinSize),y:-coinSize,size:coinSize}); }
+
+        function drawStars(){ ctx.fillStyle='#001'; ctx.fillRect(0,0,width,height); ctx.fillStyle='#fff'; stars.forEach(s=>ctx.fillRect(s.x,s.y,s.size,s.size)); }
+        function updateStars(){ stars.forEach(s=>{ s.y+=s.speed; if(s.y>height){ s.y=0; s.x=Math.random()*width; }}); }
+
+        function drawSpaceship(){ const x=player.x, y=player.y, s=playerSize; ctx.save(); ctx.translate(x,y); ctx.fillStyle='#666'; ctx.beginPath(); ctx.moveTo(0,-s); ctx.lineTo(s*0.6,s); ctx.lineTo(-s*0.6,s); ctx.closePath(); ctx.fill(); ctx.fillStyle='#0af'; ctx.beginPath(); ctx.arc(0,s*0.2,s*0.4,0,Math.PI,true); ctx.fill(); ctx.fillStyle='#444'; ctx.beginPath(); ctx.moveTo(-s*0.6,s); ctx.lineTo(-s*1.2,s*1.4); ctx.lineTo(-s*0.3,s); ctx.closePath(); ctx.fill(); ctx.beginPath(); ctx.moveTo(s*0.6,s); ctx.lineTo(s*1.2,s*1.4); ctx.lineTo(s*0.3,s); ctx.closePath(); ctx.fill(); ctx.restore(); }
+
+        function drawMeteors(){
+            meteors.forEach(m=>{
+                m.angle += 0.01;
+                const grd = ctx.createRadialGradient(0,0,m.r*0.2,0,0,m.r);
+                grd.addColorStop(0,'#bbb');
+                grd.addColorStop(1,'#333');
+                ctx.save(); ctx.translate(m.x,m.y); ctx.rotate(m.angle);
+                ctx.fillStyle = grd;
+                ctx.beginPath();
+                const pts = m.shape;
+                ctx.moveTo(pts[0].x, pts[0].y);
+                pts.forEach(p => ctx.lineTo(p.x, p.y));
+                ctx.closePath();
+                ctx.fill();
+                ctx.restore();
+            });
+        }
+
+        function drawCoins(){ ctx.fillStyle='#fa0'; coins.forEach(c=>{ ctx.beginPath(); ctx.arc(c.x+c.size/2,c.y+c.size/2,c.size/2,0,2*Math.PI); ctx.fill(); }); }
+        function drawLasers(){ ctx.fillStyle='#8ff'; lasers.forEach(l=>ctx.fillRect(l.x-l.width/2,l.y,l.width,l.height)); }
+        function drawHUD(){ ctx.fillStyle='#fff'; ctx.font='24px sans-serif'; ctx.fillText('Score:' + score,20,40); ctx.fillText('Ammo:' + ammo,20,70); }
+        function drawParticles(){ particles.forEach(p=>{ ctx.fillStyle = `rgba(${p.r},${p.g},${p.b},${p.life/60})`; ctx.beginPath(); ctx.arc(p.x,p.y,p.size,0,2*Math.PI); ctx.fill(); }); }
+
+        function updateGame(){
+            if(paused||!started) return;
+            updateStars();
+            if(exploding){
+                particles.forEach((p,i)=>{ p.x+=p.vx; p.y+=p.vy; p.life--; if(p.life<=0) particles.splice(i,1); });
+                if(!particles.length){ exploding=false; gameOver=true; restartOverlay.style.display='flex'; pauseBtn.style.display='none'; }
+                return;
+            }
+            // Player movement
+            if(keys.ArrowLeft) player.x-=player.speed;
+            if(keys.ArrowRight) player.x+=player.speed;
+            if(keys.ArrowUp) player.y-=player.speed;
+            if(keys.ArrowDown) player.y+=player.speed;
+            player.x = Math.max(playerSize, Math.min(width-playerSize, player.x));
+            player.y = Math.max(playerSize, Math.min(height-playerSize, player.y));
+
+            // Reload ammo
+            const now = Date.now(); if(ammo < maxAmmo && now - lastReload >= reloadInterval){ ammo = maxAmmo; lastReload = now; }
+
+            // Meteors
+            meteors.forEach((m,i)=>{
+                m.y += meteorSpeed;
+                if(!exploding && Math.hypot(m.x-player.x, m.y-player.y) < m.r + playerSize) triggerExplosion();
+                if(m.y - m.r > height) meteors.splice(i,1);
+            });
+            // Spawn new meteors
+            if(meteors.length < meteorCount){ const r = 20+Math.random()*10; meteors.push({ x:Math.random()*(width-40)+20, y:-50, r, angle:0, shape: createMeteorShape(r) }); }
+
+            // Coins
+            coins.forEach((c,i)=>{ c.y += 3; if(Math.hypot(c.x+coinSize/2-player.x, c.y+coinSize/2-player.y) < playerSize){ coins.splice(i,1); score += COIN_VALUE; playBeep(); spawnCoin(); } else if(c.y > height) coins.splice(i,1); });
+
+            // Lasers vs meteors
+            lasers.forEach((l,i)=>{
+                l.y -= l.speed;
+                if(l.y + l.height < 0) return lasers.splice(i,1);
+                meteors.forEach((m,mi)=>{ if(Math.hypot(m.x-l.x, m.y-l.y) < m.r){ meteors.splice(mi,1); lasers.splice(i,1); score += 20; spawnCoin(); }});
+            });
+        }
+
+        function gameLoop(){
+            if(!started) return;
+            drawStars();
+            if(exploding) drawParticles(); else { drawSpaceship(); drawMeteors(); drawCoins(); drawLasers(); drawHUD(); }
+            updateGame();
+            if(!gameOver) requestAnimationFrame(gameLoop);
+        }
+
+        function triggerExplosion(){
+            playExplosionSound();
+            exploding = true;
+            particles.length = 0;
+            for(let i=0; i<50; i++){ particles.push({ x:player.x, y:player.y, vx:(Math.random()-0.5)*6, vy:(Math.random()-0.5)*6, size:Math.random()*4+2, life:60, r:200+Math.random()*55, g:50+Math.random()*205, b:0 }); }
+        }
+
+        // Controls
+        document.addEventListener('keydown', e=>{
+            if(e.code==='Space' && ammo>0 && !keys.Space){ lasers.push({ x:player.x, y:player.y-playerSize, width:4, height:20, speed:12 }); ammo--; playBeep(1200,0.05); }
+            if(keys.hasOwnProperty(e.code)) keys[e.code] = true;
+        });
+        document.addEventListener('keyup', e=>{ if(keys.hasOwnProperty(e.code)) keys[e.code] = false; });
+        canvas.addEventListener('touchstart', handleTouch);
+        canvas.addEventListener('touchmove', handleTouch);
+        canvas.addEventListener('touchend', ()=>{ keys.ArrowLeft=keys.ArrowRight=keys.ArrowUp=keys.ArrowDown=false; });
+        function handleTouch(e){
+            e.preventDefault();
+            const rect = canvas.getBoundingClientRect();
+            const t = e.touches[0];
+            const x = t.clientX - rect.left;
+            const y = t.clientY - rect.top;
+            if(e.type==='touchstart' && Math.hypot(x-player.x, y-player.y) < 50 && ammo>0){ lasers.push({ x:player.x, y:player.y-playerSize, width:4, height:20, speed:12 }); ammo--; playBeep(1200,0.05); }
+            keys.ArrowLeft = x < player.x - 10;
+            keys.ArrowRight = x > player.x + 10;
+            keys.ArrowUp = y < player.y - 10;
+            keys.ArrowDown = y > player.y + 10;
+        }
+
+        // Buttons
+        playBtn.onclick = initGame;
+        restartBtn.onclick = initGame;
+        pauseBtn.onclick = ()=>{
+            paused = !paused;
+            if(paused){ pauseOverlay.style.display='flex'; pauseBtn.style.display='none'; }
+            else { pauseOverlay.style.display='none'; pauseBtn.style.display='flex'; requestAnimationFrame(gameLoop); }
+            pauseIcon.style.display = paused ? 'none' : 'block';
+            playIcon.style.display = paused ? 'block' : 'none';
+        };
+        resumeBtn.onclick = ()=>{ paused=false; pauseOverlay.style.display='none'; pauseBtn.style.display='flex'; pauseIcon.style.display='block'; playIcon.style.display='none'; requestAnimationFrame(gameLoop); };
+    </script>
+</body>
+</html>
